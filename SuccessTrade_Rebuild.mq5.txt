@@ -1,0 +1,418 @@
+//+------------------------------------------------------------------+
+//|                                          SuccessTrade_Rebuild.mq5 |
+//|   Reverse-engineered rebuild of "supersuccessgold_v3 TPI"        |
+//|   Structure decoded from EA panel + trade history:               |
+//|     - Trade window (02:00 - 06:30 server time)                   |
+//|     - Trade #1 of day opens at window start in trend direction   |
+//|     - Trade #2 opens only after the trend signal FLIPS           |
+//|     - Fixed dollar TP per trade (~$5), no per-trade SL           |
+//|     - Daily TP limit ($10) -> Daily Lock                          |
+//|     - Daily SL limit / Max drawdown ($200) -> Daily Lock          |
+//|     - Wind-down: close everything after window end                |
+//|     - Martingale framework (default off / level 0)                |
+//|     - Switchable trend engine (Supertrend / EMA cross / PSAR / HA)|
+//+------------------------------------------------------------------+
+#property copyright "Rebuilt with Claude"
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//--- Trend engine selection ------------------------------------------
+enum ENUM_TREND_MODE
+  {
+   TREND_SUPERTREND  = 0,   // Supertrend (ATR based)
+   TREND_EMA_CROSS   = 1,   // Fast/Slow EMA crossover
+   TREND_PSAR        = 2,   // Parabolic SAR
+   TREND_HEIKEN_ASHI = 3    // Heiken Ashi candle color
+  };
+
+//--- Inputs -----------------------------------------------------------
+input group "=== Trend Engine ==="
+input ENUM_TREND_MODE   InpTrendMode  = TREND_SUPERTREND; // Trend detection method
+input ENUM_TIMEFRAMES   InpTrendTF    = PERIOD_M1;        // Trend timeframe
+input int                InpATRPeriod = 10;               // Supertrend: ATR period
+input double             InpSTMult    = 3.0;              // Supertrend: multiplier
+input int                InpFastEMA   = 9;                // EMA cross: fast period
+input int                InpSlowEMA   = 21;               // EMA cross: slow period
+input double             InpSARStep   = 0.02;             // PSAR: step
+input double             InpSARMax    = 0.2;              // PSAR: maximum
+input int                InpHABars    = 2;                // HA: consecutive bars to confirm
+
+input group "=== Trade Window (server time) ==="
+input int                InpStartHour = 2;                // Window start hour
+input int                InpStartMin  = 0;                // Window start minute
+input int                InpEndHour   = 6;                // Window end hour
+input int                InpEndMin    = 30;               // Window end minute
+input bool                InpWindDown = true;              // Close positions after end time
+
+input group "=== Money Management ==="
+input double              InpLot            = 0.01;        // Base lot size
+input double              InpFixedTP_USD    = 5.0;         // Fixed TP target ($ per basket)
+input int                 InpMaxTradesDay   = 2;           // Max trades per day (basket)
+input double              InpDailyTPLimit   = 10.0;        // Daily TP limit ($) -> lock
+input double              InpDailySLLimit   = 200.0;       // Daily SL limit ($) -> lock
+input double              InpMaxDrawdownUSD = 200.0;       // Max floating drawdown ($) -> close & lock
+input double              InpMartingaleMult = 1.0;         // Martingale multiplier (1.0 = OFF)
+input bool                InpReentryEnabled = false;       // Re-entry enabled
+input double              InpReentryOffset  = 0.0;         // Re-entry offset (price)
+
+input group "=== System ==="
+input ulong               InpMagic   = 778899;             // Magic number
+input string              InpComment = "SuccessTrade";     // Order comment prefix
+
+//--- Globals ------------------------------------------------------------
+int      hATR     = INVALID_HANDLE;
+int      hFastEMA = INVALID_HANDLE, hSlowEMA = INVALID_HANDLE;
+int      hSAR     = INVALID_HANDLE;
+datetime g_dayStart        = 0;
+bool     g_dailyLock       = false;
+int      g_martingaleLevel = 0;
+double   g_currentLot      = 0.01;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(50);
+
+   if(InpTrendMode == TREND_SUPERTREND)
+      hATR = iATR(_Symbol, InpTrendTF, InpATRPeriod);
+   if(InpTrendMode == TREND_EMA_CROSS)
+     {
+      hFastEMA = iMA(_Symbol, InpTrendTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+      hSlowEMA = iMA(_Symbol, InpTrendTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+     }
+   if(InpTrendMode == TREND_PSAR)
+      hSAR = iSAR(_Symbol, InpTrendTF, InpSARStep, InpSARMax);
+
+   g_currentLot = InpLot;
+   return(INIT_SUCCEEDED);
+  }
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) { Comment(""); }
+//+------------------------------------------------------------------+
+//| Day boundary helpers                                              |
+//+------------------------------------------------------------------+
+datetime DayStart(datetime t)
+  {
+   MqlDateTime dt; TimeToStruct(t, dt);
+   dt.hour=0; dt.min=0; dt.sec=0;
+   return StructToTime(dt);
+  }
+
+void CheckNewDay()
+  {
+   datetime ds = DayStart(TimeCurrent());
+   if(ds != g_dayStart)
+     {
+      g_dayStart        = ds;
+      g_dailyLock       = false;
+      g_martingaleLevel = 0;
+      g_currentLot      = InpLot;
+     }
+  }
+
+bool InWindow()
+  {
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int nowM   = dt.hour*60 + dt.min;
+   int startM = InpStartHour*60 + InpStartMin;
+   int endM   = InpEndHour*60 + InpEndMin;
+   return (nowM >= startM && nowM < endM);
+  }
+
+bool AfterWindow()
+  {
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int nowM = dt.hour*60 + dt.min;
+   int endM = InpEndHour*60 + InpEndMin;
+   return (nowM >= endM);
+  }
+
+//+------------------------------------------------------------------+
+//| Trend detection:  +1 = BUY trend, -1 = SELL trend, 0 = unknown   |
+//+------------------------------------------------------------------+
+int TrendSupertrend()
+  {
+   int bars = 300;
+   double atr[]; ArraySetAsSeries(atr, true);
+   if(CopyBuffer(hATR, 0, 0, bars, atr) < bars) return 0;
+   double high[], low[], close[];
+   ArraySetAsSeries(high, true); ArraySetAsSeries(low, true); ArraySetAsSeries(close, true);
+   if(CopyHigh(_Symbol, InpTrendTF, 0, bars, high)   < bars) return 0;
+   if(CopyLow(_Symbol, InpTrendTF, 0, bars, low)     < bars) return 0;
+   if(CopyClose(_Symbol, InpTrendTF, 0, bars, close) < bars) return 0;
+
+   // iterate oldest -> newest
+   double up=0, dn=0; int dir=1;
+   for(int i=bars-2; i>=1; i--)   // use closed bars; i=1 is last closed
+     {
+      double mid = (high[i]+low[i])/2.0;
+      double bU  = mid + InpSTMult*atr[i];
+      double bL  = mid - InpSTMult*atr[i];
+
+      if(close[i+1] > up) bU = MathMax(bL, 0); // placeholder no-op
+      // trailing band rules
+      dn = (bL > dn || close[i+1] < dn) ? bL : dn;
+      up = (bU < up || close[i+1] > up || up==0) ? bU : up;
+      if(up==0) up=bU;
+      if(dn==0) dn=bL;
+
+      if(dir == 1 && close[i] < dn) { dir = -1; up = bU; }
+      else if(dir == -1 && close[i] > up) { dir = 1; dn = bL; }
+     }
+   return dir;
+  }
+
+int TrendEMACross()
+  {
+   double f[3], s[3];
+   ArraySetAsSeries(f,true); ArraySetAsSeries(s,true);
+   if(CopyBuffer(hFastEMA,0,0,3,f)<3) return 0;
+   if(CopyBuffer(hSlowEMA,0,0,3,s)<3) return 0;
+   if(f[1] > s[1]) return 1;
+   if(f[1] < s[1]) return -1;
+   return 0;
+  }
+
+int TrendPSAR()
+  {
+   double sar[3], close[3];
+   ArraySetAsSeries(sar,true); ArraySetAsSeries(close,true);
+   if(CopyBuffer(hSAR,0,0,3,sar)<3) return 0;
+   if(CopyClose(_Symbol,InpTrendTF,0,3,close)<3) return 0;
+   if(close[1] > sar[1]) return 1;
+   if(close[1] < sar[1]) return -1;
+   return 0;
+  }
+
+int TrendHeikenAshi()
+  {
+   int bars = 200;
+   double o[],h[],l[],c[];
+   ArraySetAsSeries(o,true);ArraySetAsSeries(h,true);ArraySetAsSeries(l,true);ArraySetAsSeries(c,true);
+   if(CopyOpen(_Symbol,InpTrendTF,0,bars,o)<bars) return 0;
+   if(CopyHigh(_Symbol,InpTrendTF,0,bars,h)<bars) return 0;
+   if(CopyLow(_Symbol,InpTrendTF,0,bars,l)<bars) return 0;
+   if(CopyClose(_Symbol,InpTrendTF,0,bars,c)<bars) return 0;
+
+   double haO[], haC[];
+   ArrayResize(haO,bars); ArrayResize(haC,bars);
+   // oldest index = bars-1
+   haO[bars-1]=(o[bars-1]+c[bars-1])/2.0;
+   haC[bars-1]=(o[bars-1]+h[bars-1]+l[bars-1]+c[bars-1])/4.0;
+   for(int i=bars-2;i>=0;i--)
+     {
+      haC[i]=(o[i]+h[i]+l[i]+c[i])/4.0;
+      haO[i]=(haO[i+1]+haC[i+1])/2.0;
+     }
+   // need InpHABars consecutive closed HA candles of same color (start at i=1)
+   bool allBull=true, allBear=true;
+   for(int i=1;i<=InpHABars;i++)
+     {
+      if(haC[i] <= haO[i]) allBull=false;
+      if(haC[i] >= haO[i]) allBear=false;
+     }
+   if(allBull) return 1;
+   if(allBear) return -1;
+   return 0;
+  }
+
+int GetTrend()
+  {
+   switch(InpTrendMode)
+     {
+      case TREND_SUPERTREND:   return TrendSupertrend();
+      case TREND_EMA_CROSS:    return TrendEMACross();
+      case TREND_PSAR:         return TrendPSAR();
+      case TREND_HEIKEN_ASHI:  return TrendHeikenAshi();
+     }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| History helpers (restart-safe: everything derived from history)  |
+//+------------------------------------------------------------------+
+double TodayClosedPL()
+  {
+   double pl = 0;
+   if(!HistorySelect(g_dayStart, TimeCurrent()+60)) return 0;
+   int total = HistoryDealsTotal();
+   for(int i=0;i<total;i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)InpMagic) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      pl += HistoryDealGetDouble(ticket, DEAL_PROFIT)
+          + HistoryDealGetDouble(ticket, DEAL_SWAP)
+          + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+     }
+   return pl;
+  }
+
+// number of positions OPENED today + direction of the last one
+int TodayTradeCount(int &lastDir)
+  {
+   lastDir = 0;
+   int count = 0;
+   datetime lastTime = 0;
+   if(!HistorySelect(g_dayStart, TimeCurrent()+60)) return 0;
+   int total = HistoryDealsTotal();
+   for(int i=0;i<total;i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)InpMagic) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+      count++;
+      datetime t = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(t >= lastTime)
+        {
+         lastTime = t;
+         lastDir = (HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_BUY) ? 1 : -1;
+        }
+     }
+   // include currently open positions in the count / lastDir
+   for(int i=PositionsTotal()-1;i>=0;i--)
+     {
+      ulong pt = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      if(t < g_dayStart) continue;
+      count++;
+      if(t >= lastTime)
+        {
+         lastTime = t;
+         lastDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Open positions (this EA) helpers                                  |
+//+------------------------------------------------------------------+
+int OpenPositions(double &floatingPL)
+  {
+   floatingPL = 0;
+   int n = 0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+     {
+      ulong pt = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      n++;
+      floatingPL += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+     }
+   return n;
+  }
+
+void CloseAll(string reason)
+  {
+   for(int i=PositionsTotal()-1;i>=0;i--)
+     {
+      ulong pt = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      trade.PositionClose(pt);
+     }
+   Print("SuccessTrade: basket closed (", reason, ")");
+  }
+
+//+------------------------------------------------------------------+
+//| Main                                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   CheckNewDay();
+
+   int    trend     = GetTrend();
+   double floatPL   = 0;
+   int    openPos   = OpenPositions(floatPL);
+   double dayPL     = TodayClosedPL();
+   int    lastDir   = 0;
+   int    dayTrades = TodayTradeCount(lastDir);
+   bool   inWin     = InWindow();
+
+   //--- Daily lock conditions
+   if(dayPL >= InpDailyTPLimit)   g_dailyLock = true;
+   if(dayPL <= -InpDailySLLimit)  g_dailyLock = true;
+
+   //--- Max floating drawdown protection
+   if(openPos > 0 && floatPL <= -InpMaxDrawdownUSD)
+     {
+      CloseAll("max drawdown hit");
+      g_dailyLock = true;
+     }
+
+   //--- Fixed dollar TP on the basket
+   if(openPos > 0 && floatPL >= InpFixedTP_USD)
+      CloseAll("fixed $ TP reached");
+
+   //--- Wind-down after window end
+   if(AfterWindow() && InpWindDown && openPos > 0)
+      CloseAll("wind-down after end time");
+
+   //--- Martingale lot sizing (based on last closed result today)
+   if(InpMartingaleMult > 1.0)
+     {
+      // if daily closed P/L is negative, escalate; else reset
+      if(dayPL < 0)
+         g_currentLot = NormalizeDouble(InpLot * MathPow(InpMartingaleMult, MathMin(dayTrades,5)), 2);
+      else
+        { g_currentLot = InpLot; g_martingaleLevel = 0; }
+     }
+   else g_currentLot = InpLot;
+
+   //--- Entry logic
+   string status = "WAITING";
+   if(g_dailyLock)                         status = "DAILY LOCK";
+   else if(!inWin)                         status = AfterWindow() ? "WIND-DOWN / DONE" : "WAITING FOR WINDOW";
+   else if(openPos > 0)                    status = "IN TRADE";
+   else if(dayTrades >= InpMaxTradesDay)   status = "MAX TRADES REACHED";
+   else if(trend == 0)                     status = "NO TREND SIGNAL";
+   else
+     {
+      bool doEnter = false;
+      if(dayTrades == 0)
+         doEnter = true;                               // first trade: at window start, trend direction
+      else if(trend != lastDir && trend != 0)
+         doEnter = true;                                // next trade: only on trend FLIP
+
+      if(doEnter)
+        {
+         string cmt = InpComment + (trend==1 ? " Buy" : " Sell") + " L" + IntegerToString(dayTrades+1);
+         bool ok = (trend == 1)
+                   ? trade.Buy(g_currentLot, _Symbol, 0, 0, 0, cmt)
+                   : trade.Sell(g_currentLot, _Symbol, 0, 0, 0, cmt);
+         if(ok) status = "ENTERED " + (trend==1?"BUY":"SELL");
+        }
+     }
+
+   //--- Info panel (mirrors the original)
+   string txt =
+     "===================================\n"
+     "SuccessTrade  (rebuild)\n"
+     "===================================\n"
+     "Trend Signal: " + (trend==1?"UPTREND (Buy)":(trend==-1?"DOWNTREND (Sell)":"NEUTRAL")) + "\n"
+     "Trade Window: " + StringFormat("%02d:%02d - %02d:%02d", InpStartHour,InpStartMin,InpEndHour,InpEndMin) + "\n"
+     "Window Status: " + (inWin?"ACTIVE":"INACTIVE") + "\n\n"
+     "Trading Status: " + status + "\n"
+     "Daily Lock: " + (g_dailyLock?"ACTIVE":"OFF") + "\n"
+     "Martingale Level: " + IntegerToString(g_martingaleLevel) + "\n"
+     "Current Lot Size: " + DoubleToString(g_currentLot,2) + "\n"
+     "Trades Today / Max: " + IntegerToString(dayTrades) + " / " + IntegerToString(InpMaxTradesDay) + "\n\n"
+     "Floating P&L: $" + DoubleToString(floatPL,2) + "\n"
+     "Daily Overall P&L: $" + DoubleToString(dayPL,2) + "\n"
+     "TP Mode: FIXED   Target: $" + DoubleToString(InpFixedTP_USD,2) + "\n"
+     "Re-entry: " + (InpReentryEnabled?"YES":"NO") + "   Offset: " + DoubleToString(InpReentryOffset,2) + "\n"
+     "Max Drawdown: $" + DoubleToString(InpMaxDrawdownUSD,2) + "\n"
+     "Daily SL Limit: $" + DoubleToString(InpDailySLLimit,2) + "\n"
+     "Daily TP Limit: $" + DoubleToString(InpDailyTPLimit,2) + "\n";
+   Comment(txt);
+  }
+//+------------------------------------------------------------------+
